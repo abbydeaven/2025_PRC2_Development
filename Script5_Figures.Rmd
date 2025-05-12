@@ -1,0 +1,823 @@
+---
+title: "Script 5- Figures FungalDevelopmentCode"
+author: "Abby Deaven"
+date: "2024-12-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("edgeR")
+BiocManager::install("InteractiveComplexHeatmap")
+
+install.packages("purrr")
+install.packages("dplyr")
+install.packages("edgeR")
+install.packages("tidyverse")
+install.packages("vctrs")
+install.packages("ComplexHeatmap")
+install.packages("ggtext")
+
+library(purrr)
+library(tidyverse)
+library(vctrs)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(ggplot2)
+library(ComplexHeatmap)
+library(InteractiveComplexHeatmap)
+library(ggtext)
+require("ggrepel")
+library(matrixStats)
+
+
+
+```
+
+## R Markdown
+
+
+Reading in important files:
+- Matrix of tpm values from RNA-seq samples
+- List of PRC2-targets that are upregulated (from DE analysis)
+- List of genes upregulated at any stage of development (from DE analysis)
+- Metadata
+
+```{r}
+all_tpm <- read.table("/MatrixPlotting/Average_Master_TPM.txt", header = T, sep = "\t")
+
+```
+
+
+```{r Clean up sampleFile and generate final list of H3K27me3-marked genes}
+sampleFile <- read.table("./Datasets/RNAseq_Sample_File.txt",skip=0, header=TRUE,stringsAsFactors=FALSE, row.names=2, check.names=FALSE, sep="\t")
+
+K27_K36_ComarkedGenes <- read.table("./Datasets/Final_H3K27me3_H3K36me3_Comarked_NCU.txt", header=FALSE,stringsAsFactors=FALSE, check.names=FALSE, sep="\t")
+
+
+## Removing potentially mislabeled samples from sampleFile -- these are mycelial WT samples with very high expression of H3K27me3-marked genes and do not cluster with other samples in correlation plot.
+remove_SRRs <- c("SRR13859508", "SRR11266658", "SRR11768109", "SRR5320488")
+sampleFile_filtered <- subset(sampleFile, !SRR %in% remove_SRRs)
+
+
+write.table(sampleFile_filtered, file = "./Datasets/RNAseq_Sample_File.txt", sep = "\t")
+###### Filtering list of H3K27me3-marked genes to remove outliers/genes in border regions
+#all_tpm <- column_to_rownames(all_tpm, var = "GeneID")
+
+mycelia_SRRs <- subset(sampleFile_filtered, Category == "Controls", select = SRR)
+mycelia_tpm <- data.frame(all_tpm[, colnames(all_tpm) %in% mycelia_SRRs$SRR])
+
+#Subset to only include H3K27me3/H3K36me3-marked genes, then calculate median + SD TPM for each gene
+mycelia_H3K27me3_tpm <- as.matrix(subset(mycelia_tpm, rownames(mycelia_tpm) %in% K27_K36_ComarkedGenes$V1))
+MedianTPM <- data.frame(row.names = rownames(mycelia_H3K27me3_tpm),
+                        MedianTPM = rowMedians(mycelia_H3K27me3_tpm))
+
+
+p <- ggplot(MedianTPM, aes(x = "", y = MedianTPM)) + 
+  geom_boxplot(outlier.shape = 2)
+
+## finding statistical outliers
+find_outlier <- function(x) {
+  return(x < quantile(x, .25) - 1.5*IQR(x) | x > quantile(x, .75) + 1.5*IQR(x))
+}
+
+
+pg <- ggplot_build(p)
+
+MedianTPM_Matrix <- as.matrix(MedianTPM)
+
+MedianTPM_Outliers <- MedianTPM %>% 
+  mutate(deepTools_group = ifelse(find_outlier(MedianTPM), "Outlier", "Non_Outlier")   
+)
+
+MedianTPM_Outliers <- rownames_to_column(MedianTPM_Outliers, var="GeneID")
+
+p2 <- ggplot(MedianTPM_Outliers, aes(x = outlier, y = MedianTPM)) + 
+  geom_boxplot()
+
+
+### Used deepTools to "generate a heatmap of H3K27me3-marked genes; importing bed file resulting from the first heatmap
+Heatmap_Bed <- read.table("./H3K27_H3K36_regions.bed", sep = "\t")
+colnames(Heatmap_Bed) = c("chrom", "start", "end", "GeneID", "score", "strand","v7","v8","v9","v10","v11","v12","")
+
+
+Outlier_bed_heatmap <- left_join(MedianTPM_Outliers, Heatmap_Bed, by = "GeneID")
+
+##removing median tpm column and replacing deepTools-generated clusters
+Outlier_Bed_File <- cbind(Outlier_bed_heatmap[,1],Outlier_bed_heatmap[,4:14],Outlier_bed_heatmap[,3])
+write.table(Outlier_Bed_File, file = "./H3K27me3_H3K36me3_silent_genes.bed", sep="\t", quote=FALSE)
+
+#Return final set of genes that are not outliers
+
+K27_K36_ComarkedGenes_Silent <- subset(MedianTPM_Outliers, deepTools_group == "Non_Outlier", select = GeneID )
+write.table(K27_K36_ComarkedGenes_Silent, file="./Final_Silent_H3K27me3_Genes.txt", sep ="\t")
+```
+
+```{r}
+#Read in files generated above
+sampleFile <- read.table("./Datasets/RNAseq_Sample_File.txt",skip=0, header=TRUE,stringsAsFactors=FALSE,  check.names=FALSE, sep="\t")
+
+K27_K36_ComarkedGenes <- read.table(".//Final_Silent_H3K27me3_Genes.txt", header=FALSE,stringsAsFactors=FALSE, check.names=FALSE, sep="\t")
+
+##Some RNA-seq samples were removed from analysis (deleted from sampleFile) -- making sure that every sample included in the analysis is represented in sampleFile
+
+all_tpm_filtered <- all_tpm[,colnames(all_tpm) %in% sampleFile$SRR]
+
+
+```
+
+
+```{r filtering sexual development datasets}
+## Creating separate dataset of older sexual development RNA-seq (Wang et al. 2014) - will use Liu et. al 2017 dataset for main analysis
+
+#removing old sexual development dataset from tpm matrix
+old_sexdev_SRR <- sampleFile %>%
+  filter(Source.Name == "Old_SexualDevelopment") %>%
+    select(SRR)
+
+#all Wang et, al samples start with SRR5856
+all_tpm_sexdev1 <- all_tpm_filtered %>% select(-contains("SRR5856")) 
+
+
+```
+
+## Figure 1B: Jitter plot of H3K27me3-target induction
+
+```{r Fig1B - Jitter plot of H3K27me3-enriched gene induction}
+
+### Obtain a matrix of TPM+1 values for each gene in each sample, divided by category
+  
+  ## Select only sexual development dataset from Liu et. al 2017
+  all_tpm_sexdev1 <- all_tpm_sexdev1 %>% rownames_to_column(var = "GeneID")
+
+  ## Convert TPM matrix to longform table using pivot_longer, add metadata from sampleFile, and add a pseudocount column
+  avg_tpm_longer_meta <- all_tpm_sexdev1 %>% 
+    pivot_longer(cols = !GeneID, names_to = "SRR", values_to = "TPM") %>%
+    left_join(sampleFile, by= c("SRR" = "SRR")) %>% 
+    mutate(TPM_plusPC = TPM+1)
+
+  ## Remove outliers --- anything > 95th percentile is normalized to the 95th percentile
+  qn = quantile(avg_tpm_longer_meta$TPM_plusPC, c(0.05, 0.95), na.rm = TRUE)
+
+  avg_tpm_longer_meta_normalized = within(avg_tpm_longer_meta, { TPM_plusPC = ifelse(TPM_plusPC < qn[1], qn[1], TPM_plusPC)
+                                                                 TPM_plusPC = ifelse(TPM_plusPC > qn[2], qn[2], TPM_plusPC)})
+
+write.table(avg_tpm_longer_meta, file = ".//MatrixPlotting/Avg_TPM_plusPC_withMeta.txt", sep ="\t")
+#avg_tpm_longer_meta2 <- read.table("./MatrixPlotting/Avg_TPM_plusPC_withMeta.txt")
+
+### Calculate stats###
+
+  #First, make melted df with only PRC2 target genes
+  PRC2targetsOnly_Data <- filter(avg_tpm_longer_meta, GeneID %in% K27_K36_ComarkedGenes[,1])
+
+  #Second, calculate average expression and sd for each gene;
+  Averaged_GE <- PRC2targetsOnly_Data %>% 
+   group_by(SRR,SampleID,GeneID,Category) %>%
+   summarize(AveragePC_perGene = mean(TPM_plusPC),
+            SdPC_perGene = sd(TPM_plusPC)) 
+
+  #Calculate average TPM for all Samples adn the SD for all samples
+  Averaged_GE_AllSamples <- Averaged_GE %>% 
+   group_by(GeneID) %>%
+   summarize(MeanExpressionLevel_AllStrains = mean(AveragePC_perGene),
+            MedianExpressionLevel_AllStrains = median(AveragePC_perGene),
+            VariationInExpression_AllStrains= sd(AveragePC_perGene))
+
+  #Calculate Average expression of PRC2 target genes for the set
+  Averaged_GE <- left_join(Averaged_GE, Averaged_GE_AllSamples, by="GeneID")
+  Averaged_GE_count <- length(unique(Averaged_GE$GeneID))
+  Averaged_GE <- Averaged_GE %>% subset(MedianExpressionLevel_AllStrains < 6)
+  Averaged_GE_count2 <- length(unique(Averaged_GE$GeneID))
+
+  #Calculate z-scores
+  Averaged_GE <- Averaged_GE %>%
+  group_by(SRR,SampleID,GeneID,Category) %>%
+  mutate(Z = ((.data[["AveragePC_perGene"]] - .data[["MeanExpressionLevel_AllStrains"]])/.data[["VariationInExpression_AllStrains"]]))
+
+
+  #Third, calculate the average expression of all PRC2 target genes for each strain (locus)
+  SampleStats <- Averaged_GE %>% 
+  group_by(SRR,SampleID, Category) %>%
+  summarize(Mean = mean(AveragePC_perGene, na.rm=TRUE),
+            NumberofGenes_ZaboveOne = sum(Z>1),
+            NumberofGenes_ZabovePointFive = sum(Z>.5),
+            MeanZ = mean(Z),
+            MedianZ = median(Z),
+            Median = median(AveragePC_perGene),
+            SD = sd(AveragePC_perGene))
+
+  # Calculating Induction Score -- Mean Expression of K27me3-marked genes * Percentage of H3K27me3-marked genes with Z > .5
+  SampleStats <- SampleStats %>%
+    mutate(Score = (Mean)*((NumberofGenes_ZabovePointFive)/516))
+
+
+write.table(SampleStats, file="./MatrixPlotting/SampleStats.txt", sep= "\t")
+
+### In Excel, sorted SampleStats table by category and induction score, then read back in to use order for heatmapping ###
+
+SampleStats_sorted <- read.table("./MatrixPlotting/SampleStats_Ordered.txt", sep = "\t", header = TRUE)
+
+
+#Setting distance between violins in plot
+## Plotting induction score ##
+library(ggplot2)
+require("ggrepel")
+install.packages("ggh4x")
+library(ggh4x)
+library(scales)
+
+SampleStats_sorted2 <- SampleStats_sorted %>% 
+#  group_by(Category) %>% mutate(n = n()) %>% 
+  mutate(label = paste0(Category))
+
+SampleStats_sorted2$label <- as.character(SampleStats_sorted2$label)
+#Then turn it back into a factor with the levels in the correct order
+SampleStats_sorted2$label <- factor(SampleStats_sorted2$label, levels=unique(SampleStats_sorted2$label))
+
+p <- SampleStats_sorted2 %>%
+  ggplot(aes(x=factor(label), Score)) + 
+    geom_jitter(width = 0.2, aes(fill = factor(label)), size = 4, shape = 21, colour = "black", show.legend = FALSE) +
+  scale_fill_manual("",values = c("#F0E442","#56B4DF", "#009E73", "#D55E00","#0072B2", "#E69F00",    "#CC79A7")) +
+    labs(x="Experiment Category", y="Induction Score") +
+#  theme(axis.text=element_text(size=18), axis.title = element_text(size = 20))+
+        theme(panel.background = element_rect(color=NA, fill = "white"))+
+         theme(plot.background = element_rect(fill = "white"))+
+        theme(axis.line = element_line(color = "black",
+                                 linewidth = 1))+
+        scale_x_discrete(labels = label_wrap(10)) +
+    theme(axis.text.x=element_text(angle=45, hjust=1, size=18), panel.spacing.x=unit(0.5, "lines"), axis.title=element_text(size=17)) +
+    theme(axis.text.y=element_text(hjust=1, size=17), panel.spacing.y=unit(0.5, "lines")) 
+p
+   ggsave("./Plots/FinalVersions/Fig1b_Developmental_Induction_jitterplot.png", plot=p, width = 6, height = 8.3, unit="in",  dpi=400)
+
+```
+
+Figure 1C: Heatmap of relative expression H3K27me3-marked genes 
+
+```{r Figure 1D - TPM Heatmap}
+### In Excel, sorted SampleStats table by category and induction score, then read back in to use order for heatmapping ###
+SampleStats_sorted <- read.table("./SampleStats_Ordered.txt", sep = "\t", header = TRUE)
+SRR_Order <- SampleStats_sorted %>% 
+  select(SRR, Category, Order)
+
+#Identify samples with upregulation in order to sort rows - > 100 genes with z-score > 0.5
+upregulated_srrs <- SampleStats_sorted %>% filter(NumberofGenes_ZabovePointFive > 100) %>% select(SRR)
+    #upregulated SRRs = SRR8065394, SRR5000485, SRR8860874, SRR8860876, SRR5177527, SRR5177525, SRR5177523, SRR5177521
+
+
+SRR <- SRR_Order$SRR
+## subset PRC2-target longform matrix to only include SRRs we want ##
+PRC2targetsOnly_Data_Subset <- subset(PRC2targetsOnly_Data, SRR %in% SRR_Order$SRR)
+
+#Subset to only include GeneID, SRR, and TPM+PC
+PRC2map <- data.frame(cbind(PRC2targetsOnly_Data_Subset$GeneID, PRC2targetsOnly_Data_Subset$SRR, PRC2targetsOnly_Data_Subset$TPM_plusPC))
+colnames(PRC2map) <- c("GeneID","SRR","TPM_plusPC")
+PRC2map$TPM_plusPC <- as.numeric(PRC2map$TPM_plusPC)
+
+
+#Arrange matrix in order
+sorted_prc2mapmatrix <- right_join(SRR_Order, PRC2map, by = c("SRR" = "SRR"), relationship = "one-to-many")
+sorted_prc2mapmatrix <- sorted_prc2mapmatrix %>% select(SRR, GeneID, TPM_plusPC)
+
+##Pivot to wideform matrix##
+PRC2mapmatrix <- sorted_prc2mapmatrix %>% 
+  pivot_wider( 
+  names_from = SRR, 
+  values_from = TPM_plusPC) %>%
+  column_to_rownames(var = "GeneID")
+  
+
+PRC2mapmatrix <- as.matrix(PRC2mapmatrix)
+
+## Calculate sample size of each category for annotation row ##
+nrow(SRR_Order[SRR_Order$Category == "Controls",]) #8
+nrow(SRR_Order[SRR_Order$Category == "WildIsolates",]) #111
+nrow(SRR_Order[SRR_Order$Category == "AsexualDevelopment",]) #20
+nrow(SRR_Order[SRR_Order$Category == "LightResponse",]) #20
+nrow(SRR_Order[SRR_Order$Category == "Stress_Drug_Response",]) #37
+nrow(SRR_Order[SRR_Order$Category == "Carbon_Nitrogen_Source",]) #36
+nrow(SRR_Order[SRR_Order$Category == "SexualDevelopment",]) #4
+
+
+### Plot using complex heatmap ###
+library(ComplexHeatmap)
+library(circlize)
+
+#Create annotation dataframe for group categories
+anno_df = data.frame(
+    Category = SRR_Order$Category)
+
+ha = HeatmapAnnotation(df = anno_df,
+          col = list(Category = c("Controls"= "#F0E442", 
+                                  "Wild Isolates" = "#56B4DF", 
+                                  "Asexual Development" = "#009E73",
+                                  "Light Response" = "#D55E00", 
+                                  "Stress/Drug Response" = "#0072B2", 
+                                  "Carbon/Nitrogen Source" = "#E69F00",
+                                  "Sexual Development" = "#CC79A7")),
+          annotation_legend_param = list(title = "Category",  border = "black", title_position = "leftcenter-rot", legend_height = unit(4, "cm")))
+
+#Define color palette and format legend
+col_fun2 = colorRamp2(c(-10, 0, 10), c("#5e3c99","#F8F2EA","#e66101"))
+lgd = Legend(col_fun = col_fun2, title = "Relative Expression")
+
+
+
+#Calculate z-scores for all experiments
+scaled_tpmPC_matrix = t(scale(t(PRC2mapmatrix)))
+
+##Subset to cluster rows based on development samples
+scaled_tpmPC_matrix_devonly <- as.data.frame(scaled_tpmPC_matrix)
+scaled_tpmPC_matrix_devonly <- scaled_tpmPC_matrix_devonly %>% select(SRR8065394, SRR5000485, SRR8860874, SRR8860876, SRR5177527, SRR5177525, SRR5177523, SRR5177521)
+
+  # Plot sexual development samples on a heatmap and export order of rows
+  heatmap_ORDER_dev <- Heatmap(scaled_tpmPC_matrix_devonly, col=col_fun2, cluster_columns = FALSE, show_row_names = TRUE, show_column_dend = FALSE, show_row_dend = FALSE, cluster_rows = TRUE, clustering_method_rows = "centroid")
+  ht <- draw(heatmap_ORDER_dev)
+  devRowOrder <- row_order(ht)
+  dev_ordered_rownames <- rownames(scaled_tpmPC_matrix_devonly)[unlist(devRowOrder)]
+
+
+
+  #Plot heatmap
+ dev_tpm_plot <- Heatmap(scaled_tpmPC_matrix, col = col_fun2, 
+                    border = "black",
+                    cluster_columns = F, show_row_names = FALSE,
+                    show_column_dend = FALSE, show_row_dend = FALSE,
+                    show_column_names = FALSE,
+                    row_order = devRowOrder,row_title = "PRC2-methylated Genes", row_title_side = "left",
+                    column_order = sort(SRR_Order$Order), 
+                    column_split = factor(SRR_Order$Category, levels = c("Controls", "Wild Isolates",  "Light Response", "Stress/Drug Response", "Carbon/Nitrogen Source","Asexual Development", "Sexual Development")), cluster_column_slices = FALSE,
+                    heatmap_legend_param = list(title = "Relative Expression",  border = "black", title_position = "leftcenter-rot", legend_height = unit(4, "cm")),
+                    top_annotation = ha,
+                    width = unit(18, "cm"), height = unit(8, "cm"))
+ht2 <- draw(dev_tpm_plot)
+
+png("./Plots/FinalVersions/Fig1D_clustered__alltpm_zscore_heatmap_raw.png",width=30,height=12,units="cm",res=1200)
+draw(ht2)
+dev.off()
+
+
+```
+Figure 1e -- Venn diagram of number of genes differentially expressed in different conditions
+
+
+```{r Fig 1e - Venn Diagram}
+################## Making Venn diagram of induction (Figure 1d)
+#reading in DE gene lists and DE metadata#
+dev_H3K27me3_genes <- read.table("./DifferentialExpression/Developmental_Induced_Genes_H3K27me3.txt", sep = "\t")
+dev_genes <- read.table("./DifferentialExpression/Developmental_Induced_Genes_all.txt", sep = "\t")
+dev_nonprc2 <- read.table("./DifferentialExpression/Developmental_Induced_Genes_nonH3K27me3.txt", sep = "\t")
+DE_all_meta <- read.table("./DifferentialExpression/DE_all_meta.txt", sep = "\t")
+
+nrow(H3K27me3_genes) #440
+nrow(dev_genes) #2993
+nrow(dev_nonprc2) #2553
+
+install.packages("VennDiagram")
+library(VennDiagram)
+
+library(RColorBrewer)
+colors <- c("springgreen2", "orchid1")
+
+## Venn diagram of PRC2-target induction ##
+ venn.diagram(
+    x = list(H3K27me3_genes, dev_genes),
+    category.names = c("H3K27me3-enriched", "Development-Induced"),
+    filename = './Fig1e_Venn_Diagram.png',
+    output = TRUE,
+    imagetype = "png",
+    height = 1200,
+    width = 1100,
+    resolution = 300,
+    compression = "lzw",
+    lwd = 1,
+    lty = 0.5,
+    fill = colors,
+            cex = .5,
+        fontface = "bold",
+        fontfamily = "sans",
+            cat.cex = 0.5,
+        cat.fontface = "bold",
+        cat.fontfamily = "sans",
+              cat.pos = c(-27, 27),
+          cat.dist = c(0.055, 0.055))
+
+### Edited text sizes and added borders in Illustrator ###
+
+
+```
+
+Figure 1e - Violin plot of expression of H3K27me3-enriched and non-H3K27me3-enriched genes
+```{r}
+## obtaining SRRs of developmental samples, using DE metadata file
+SRR <- DE_all_meta$SRR
+
+## subsetting TPM matrix to obtain development samples, and then rearranging in chronological order
+dev_samples <- all_tpm[,colnames(all_tpm) %in% SRR]
+
+dev_samples <- data.frame(cbind(rowMeans(dev_samples[,1:3]), dev_samples[,7], dev_samples[,6], dev_samples[,5], dev_samples[,4]))
+
+colnames(dev_samples) <- c("Mycelia", "dpf3", "dpf4", "dpf5", "dpf6")
+
+
+dev_samples_log <- dev_samples %>%
+                   mutate_all(as.numeric) %>%
+                   rownames_to_column(var = "GeneID")
+                  
+
+dev_samples_log_long <- dev_samples_log %>%
+                  pivot_longer(cols = !GeneID, names_to = "Sample", values_to = "TPM")
+
+dev_samples_log_long <- dev_samples_log_long %>% 
+                  mutate(log2TPM_plusPC = log((TPM + 1), base = 2))
+                         
+
+
+dev_samples_log_long$log2TPM_plusPC <- as.numeric(dev_samples_log_long$log2TPM_plusPC)
+#timecourse_logTPM_longer <- timecourse_logTPM %>%
+#       pivot_longer(cols = !GeneID, names_to = "Sample", values_to = "log2TPM_plusPC")
+
+
+#Calculating log2(TPM+PC)
+
+### Subsetting longform l2TPM+PC matrix to H3K27me3 and non-H3K27me3 genes (dev_non_prc2 = list of non-H3K27me3 marked but developmentally-induced genes) and then adding a column stating they are H3K27me3-depleted/enriched
+  ## Also subsetting to only be WT mycelia + developmental timecourse samples
+Timecourse_Samples <- c("Mycelia", "dpf3", "dpf4", "dpf5", "dpf6")
+
+l2TPM_PC_matrix <- dev_samples_log_long %>%
+        filter(Sample %in% Timecourse_Samples)
+
+dev_non_prc2 <- dev_samples_log_long %>%
+  filter(GeneID %in% dev_nonprc2$GeneID) %>%
+  mutate(Category = str_wrap("Not PRC2 -methylated", width = 5))
+
+prc2_samples <- dev_samples_log_long %>%
+  filter(GeneID %in% dev_H3K27me3_genes$x) %>%
+  mutate(Category = str_wrap("PRC2 -methylated", width = 5))
+
+#merging each matrix together
+total <- rbind(prc2_samples, dev_non_prc2)
+total$Category = str_wrap(total$Category, width = 12)
+
+### this part is just for determining the order of samples in the violin plot -- groups genes by sample (3dpf, mycelia, etc) and then summarizes how many total genes are in each sample (is the same for each one) ###
+total2 <- total %>%
+  group_by(Sample)
+total_dist = total %>%
+  group_by(Sample) %>% summarise(num=n())
+
+#Setting distance between violins in plot
+dodge <- position_dodge(width = 1)
+###  plotting violin plot
+### this chunk is just for putting samples in the order that I want ###
+violin <- total2 %>%
+  left_join(total_dist) %>%
+  arrange(factor(Sample, levels = c("Mycelia", "3dpf", "4dpf", "5dpf", "6dpf"))) %>%
+  mutate(Sample = fct(Sample)) %>%
+  ### everything below is the actual violin plot ###
+  ggplot(aes(x=Sample, y=log2TPM_plusPC)) + 
+    geom_violin(aes(fill = factor(Category)), position = dodge, scale="width", trim=FALSE) +
+    geom_boxplot(aes(group=interaction(Category,Sample)),
+         width=0.2, fill="white", position=dodge, outlier.shape=NA) +
+    scale_fill_manual("",values = c("springgreen2", "orchid1")) +
+    labs(
+       x = "Condition",
+       y = expression("Expression Level (log "[2]~"(TPM+1)")) + 
+    theme(axis.title= element_text(24)) + 
+      theme(panel.background = element_rect(color=NA, fill = "white"))+
+      theme(plot.background = element_rect(fill = "white"))+
+      theme(axis.line = element_line(color = "black",
+                                 linewidth = 1))+
+    theme(legend.text=element_text(size=24)) +
+    theme(axis.text.x=element_text(angle=45, hjust=1, size=24), panel.spacing.x=unit(0.5, "lines")) +
+    theme(axis.text.y=element_text(hjust=1, size=20), panel.spacing.y=unit(0.5, "lines"))
+
+
+print(violin)
+ggsave("./Plots/FinalVersions/Fig1e_Induction_ViolinPlot.png", plot=violin, width = 12, height = 9, unit="in",  dpi=400)
+
+```
+
+
+
+FIGURE 2 Panels
+
+Figure 2b - jitterplot of size of protoperithecia, perithecia, and false perithecia. 
+
+```{r}
+install.packages("car")
+install.packages("dunn.test")
+install.packages("FSA")
+
+library(car)
+library(dunn.test)
+library(FSA)
+
+FP_data <- data.frame(read.table("./Datasets/7day_FalsePerithecia_Results.txt", header = TRUE, sep="\t"))
+
+###breaking up to individual samples
+
+WT_proto <- subset(FP_data,FP_data$Sample == "WT_Day7")
+set7_FP <- subset(FP_data, FP_data$Sample == "set7_Day7")
+WT_peri <- subset(FP_data, FP_data$Sample == "WT_7dpf_Perithecia")
+
+## Rebuilding in the order that I want
+FP_data2 <- rbind(WT_proto, set7_FP, WT_peri)
+
+sample_size = FP_data2 %>%
+  group_by(Sample) %>% summarise(num=n())
+
+#Setting distance between violins in plot
+dodge <- position_dodge(width = 1)
+###  plotting violin plot
+### this chunk is just for putting samples in the order that I want ###
+jitter <- FP_data2 %>%
+  left_join(sample_size) %>%
+      mutate(Sample = paste0(Sample, "\n", "n=", num)) %>%
+  arrange(factor(Sample, levels = c("WT_Day7", "set7_Day7", "WT_7dpf_Perithecia"))) %>%
+  mutate(Sample = fct(Sample)) %>%
+   ggplot(aes(x = Sample, y = Diameter)) + 
+   geom_jitter(aes(fill = factor(Sample)),
+            size = 2, shape = 21, colour = "black", show.legend = FALSE, width= 0.2) +
+      scale_fill_manual("",values = c("darkorange", "springgreen1", "orchid1")) +
+            scale_x_discrete(guide = guide_axis(angle=45), , labels = c("Protoperithecia", expression(italic(Delta~set7)~'False Perithecia'), "Perithecia"))+ 
+      labs(
+       x = "Sample",
+       y = expression("Diameter (mm)")) + 
+    theme_classic(base_size = 20) +
+   theme(aspect.ratio = 1)+
+  force_panelsizes(rows = unit(15, "cm"),
+                   cols = unit(10, "cm")) 
+
+   ggsave("./Fig2i_FP_Jitterplot.png", plot=jitter, width = 14, height = 22, unit="cm",  dpi=400)
+
+
+### Testing normality for stats ###
+qqnorm(WT_peri$Diameter, main='Normal')
+plot.new(qqline(WT_peri$Diameter))
+
+shapiro.test(WT_peri$Diameter) # W = 0.97611, p = 0.003018
+shapiro.test(WT_proto$Diameter) # W = 0.96699, p = 0.0006559
+shapiro.test(set7_FP$Diameter) # W = 0.91368, p = 3.099e-12
+### all sets are non-normally distributed ###
+
+## testing equal variances ##
+bartlett.test(Diameter ~ Sample, data = FP_data)
+
+# result:
+# Bartlett test of homogeneity of variances
+# data:  Diameter by Sample
+# Bartlett's K-squared = 358.09, df = 2, p-value < 2.2e-16
+
+## variances are different -- using Kruskal-Wallis test
+kruskal.test(Diameter ~ Sample,
+  data = FP_data)
+
+#	Kruskal-Wallis rank sum test
+#   data:  Diameter by Sample
+#   Kruskal-Wallis chi-squared = 379.8, df = 2, p-value < 2.2e-16
+
+dunnTest(Diameter~Sample, data=FP_data,
+  method = "holm")
+   
+```
+
+Figure 2j -- expression of DIGs in false perithecia RNA-seq samples.
+
+Fig 2J: log2FC + log2TPM+1 for H3K27me3-marked and developmentally-induced genes from false perithecia data and wild-type sexual development timecourse RNA samples
+
+```{r 2j part 1 - log2FC values}
+## Modifying so L2FC = 0 if not significant
+de_gene_matrix <- read.table("./DifferentialExpression/DE_Gene_Matrix.txt", sep = "\t")
+H3K27me3_genes <- read.table("./Final_Silent_H3K27me3_Genes.txt", sep="\t")
+
+##Setting L2FC to 0 if not signficant
+de_gene_matrix$Corrected_logFC <- with(de_gene_matrix, ifelse(FDR > 0.05, 0, logFC))
+
+##Pivoting to wideform matrix to for heatmapping
+deL2FC_matrix <- de_gene_matrix %>% 
+    select(Sample, GeneID, Corrected_logFC) %>%
+  pivot_wider( 
+  names_from = Sample, 
+  values_from = Corrected_logFC)
+deL2FC_matrix <- deL2FC_matrix %>% column_to_rownames(var = "GeneID")
+
+  # Changing order of columns
+  deL2FC_matrix <- deL2FC_matrix %>% relocate(WT,  set7, PPwt_mata, PPwt_matAA, FPset7_mata, FPset7_matAA, dpf3, dpf4, dpf5, dpf6)
+
+
+  #Filtering to separate H3K27me3-marked genes and other developmentally-induced genes
+  l2fc_K27genes <- as.matrix(deL2FC_matrix[rownames(deL2FC_matrix) %in% H3K27me3_genes$V1,])
+  l2fc_developmentsamples <- as.matrix(deL2FC_matrix[rownames(deL2FC_matrix) %in% dev_nonprc2$GeneID, ])
+
+  k27_included_genes <- rownames(l2fc_K27genes)
+#l2fc_set7_K27genes <- as.matrix(l2fc_set7[rownames(l2fc_set7) %in% H3K27me3_genes$V1,])
+#l2fc_set7_developmentsamples <- as.matrix(l2fc_set7[rownames(l2fc_set7) %in% dev_nonprc2$GeneID, ])
+
+
+  #Identifying minimum, maximum values to set axis
+  min(l2fc_K27genes) # -9.45  
+  max(l2fc_developmentsamples) ### 15.29
+
+  col_fun_lfc = colorRamp2(c(-10, 0, 15), c("#4dac26","#f7f7f7","#d01c8b"))
+
+
+```
+
+
+```{r 2j part 2 - log2TPM+1 values}
+### Reading in samples and required information
+all_tpm <- read.table("./MatrixPlotting/Average_Master_TPM.txt", sep="\t")
+FP_tpm <- read.table("./MatrixPlotting/FP_avg_tpm.txt", sep = "\t")
+
+all_tpm <- as.data.frame(all_tpm)
+all_tpm <- all_tpm %>% rownames_to_column(var = "GeneID")
+
+dev_nonprc2 <- read.table("./DifferentialExpression/Developmental_Induced_Genes_nonH3K27me3.txt", sep = "\t")
+dev_genes_H3K27 <- read.table("./DifferentialExpression/Developmental_Induced_Genes_H3K27me3.txt", sep = "\t")
+
+### Obtaining TPM values for controls used in differential expression analysis + WT perithecia samples. Note - for TPM+1 heatmap, all WT samples are merged instead of separating WT_1 and WT_2
+
+dev_control_tpm <- all_tpm %>%
+  select(GeneID, SRR5177529, SRR11266659, SRR11768110, SRR5177527, SRR5177525, SRR5177523, SRR5177521)
+
+  ##Averaging control samples
+  dev_control_tpm_averaged <- dev_control_tpm %>%
+  rowwise() %>%
+  mutate(Mycelia = mean(c_across(c(SRR5177529, SRR11266659, SRR11768110)), na.rm = TRUE)) %>%
+  rename(SRR5177527 = "dpf3") %>%
+  rename(SRR5177525 = "dpf4") %>%
+  rename(SRR5177523 = "dpf5") %>%
+  rename(SRR5177521 = "dpf6") %>%
+  select(-SRR5177529, -SRR11266659, -SRR11768110) %>%
+  relocate("Mycelia","dpf3", "dpf4", "dpf5", "dpf6") %>%
+  ungroup()
+  
+  ## Joining FP, controls, and perithecia TPM into one dataframe
+  merged_data <- FP_tpm %>%
+    rownames_to_column(var = "GeneID") %>%
+    full_join(dev_control_tpm_averaged, by = "GeneID", keep = FALSE)
+
+write.table(merged_data, file="./MatrixPlotting/Merged_FP_TPM_data.txt", sep = "\t")
+
+### Melt merged data for analysis and add a pseudocount column
+merged_tpm_longer_pc <- merged_data %>% 
+  pivot_longer(cols = !GeneID, names_to = "Sample", values_to = "TPM") %>%
+  mutate(TPM_plusPC = TPM+1) %>%
+  select(-TPM)
+  merged_tpm_longer_pc$TPM_plusPC <- as.numeric(merged_tpm_longer_pc$TPM_plusPC)
+
+  ## Remove outliers --- anything > 95th percentile is normalized to the 95th percentile
+  qn = quantile(merged_tpm_longer_pc$TPM_plusPC, c(0.05, 0.95), na.rm = TRUE)
+
+  merged_tpm_longer_pc2 = within(merged_tpm_longer_pc, { TPM_plusPC = ifelse(TPM_plusPC < qn[1], qn[1], TPM_plusPC)
+                                                            TPM_plusPC = ifelse(TPM_plusPC > qn[2], qn[2], TPM_plusPC)})
+
+  ## Adding Logtransform TPM plus PC column
+  merged_tpm_longer_pc2 <- merged_tpm_longer_pc %>% mutate(log2TPM_plusPC = log(TPM_plusPC, base = 2))
+  merged_tpm_longer_pc2$log2TPM_plusPC <- as.numeric(merged_tpm_longer_pc2$log2TPM_plusPC)
+
+#Pivot back to wide form for heatmapping
+  tpmPC_matrix <- merged_tpm_longer_pc2 %>% 
+  select(GeneID, Sample, log2TPM_plusPC) %>%
+  pivot_wider( 
+  names_from = Sample, 
+  values_from = log2TPM_plusPC ) %>%
+  column_to_rownames(var = "GeneID") %>%
+  rename(WT_matAA_PP = "PPwt_matAA") %>%
+  rename(WT_mata_PP = "PPwt_mata") %>%
+  relocate(Mycelia, set7_Mycelia, PPwt_matAA, PPwt_mata, set7_matAA_FP, set7_mata_FP, dpf3, dpf4, dpf5, dpf6)
+
+### Preparing data for heatmap
+  ## creating list of H3K27me3-marked genes that were NOT excluded from DE analysis
+
+  ## Filtering to separate H3K27me3-marked genes and other developmentally-induced genes
+  tpmPC_K27genes <- tpmPC_matrix %>%
+    rownames_to_column(var = "GeneID") %>%
+    filter(GeneID %in% k27_included_genes) %>%
+    column_to_rownames(var = "GeneID")
+  tpmPC_K27genes <- as.matrix(tpmPC_K27genes)
+
+  tpmPC_developmentsamples <- as.matrix(tpmPC_matrix[rownames(tpmPC_matrix) %in% dev_nonprc2$GeneID, ])
+
+  #Identifying minimum, maximum values to set axis
+  min(tpmPC_matrix) # 0.42297  
+  max(tpmPC_matrix) ### 18.20541
+
+  col_fun_tpm = colorRamp2(c(0, 5, 10), c("#fff7f3","#fa9fb5","#7a0177"))
+
+### Making a merged dataset of L2FC + TPMpc values for developmental samples to set row order
+  #Using WT sexual development samples to set row order for full heatmap
+    l2fc_timecourse <- deL2FC_matrix %>% 
+    select(PPwt_matAA, PPwt_mata, dpf3, dpf4, dpf5, dpf6) %>% 
+    mutate_all(as.numeric) %>%
+    rownames_to_column(var = "GeneID")
+
+
+    tpmPC_timecourse <- tpmPC_matrix %>% 
+    mutate_all(as.numeric) %>% 
+    select(PPwt_matAA, PPwt_mata, dpf3, dpf4, dpf5, dpf6) %>%
+    rownames_to_column(var = "GeneID") 
+    
+    
+  # Merging timecourse samples to one dataset
+    merged_timecourse <- l2fc_timecourse %>%
+    left_join(tpmPC_timecourse, by = join_by("GeneID"), copy = TRUE) %>%
+    column_to_rownames(var = "GeneID")
+  
+  # Separating into H3K27me3-marked and non-H3K27me3 developmental gene lists 
+    merged_timecourse_K27genes <- as.matrix(merged_timecourse[rownames(merged_timecourse) %in% k27_included_genes,])
+    merged_timecourse_developmentsamples <- as.matrix(merged_timecourse[rownames(merged_timecourse) %in% dev_nonprc2$GeneID, ])
+
+
+  ## Plotting each geneset to find universal row order
+    #A: H3K27me3-marked genes
+   H3K27me3_order <- Heatmap(merged_timecourse_K27genes, col=col_fun_lfc, show_row_names = FALSE, cluster_columns = FALSE, show_column_dend = FALSE, show_row_dend = FALSE, cluster_rows = TRUE, clustering_method_rows = "complete")
+
+   ht1 <- draw(H3K27me3_order)
+   H3K27me3_RowOrder <- row_order(ht1)
+   H3K27me3_RowOrder_rownames <- rownames(merged_timecourse_K27genes)[unlist(H3K27me3_RowOrder)]
+
+    #B: Developmentally-induced genes
+    dev_order <- Heatmap(merged_timecourse_developmentsamples, col=col_fun_lfc, show_row_names = FALSE, cluster_columns = FALSE, show_column_dend = FALSE, show_row_dend = FALSE, cluster_rows = TRUE, clustering_method_rows = "complete")
+  
+    ht2 <- draw(dev_order)
+    dev_RowOrder <- row_order(ht2)
+    dev_RowOrder_rownames <- rownames(merged_timecourse_developmentsamples)[unlist(dev_RowOrder)]
+```
+
+
+```{r 2j part 3 - actual heatmaps}
+
+##Plotting L2FC values for H3K27me3-marked genes and developmentally-induced genes
+  #A: H3K27me3-marked genes:
+  l2fc_plot_k27 <- Heatmap(l2fc_K27genes, col = col_fun_lfc, 
+                    border = "black",
+                    cluster_columns = F, show_column_dend = FALSE, show_column_names = FALSE,
+                    show_row_names = FALSE,  show_row_dend = FALSE, show_heatmap_legend = FALSE,
+                     row_title = "PRC2-methylated", row_title_side = "left", row_title_gp = gpar(fontsize = 16),
+                    row_order = H3K27me3_RowOrder_rownames, 
+                    heatmap_width = unit(12, "cm"), height = unit(6, "cm"))
+ht3 <- draw(l2fc_plot_k27)
+
+   #B: Developmentally-induced genes
+  l2fc_plot_devgene <- Heatmap(l2fc_developmentsamples, col = col_fun_lfc, 
+                    border = "black",
+                    cluster_columns = F, show_column_dend = FALSE, show_column_names = TRUE,
+                    show_row_names = FALSE,  show_row_dend = FALSE, show_heatmap_legend = TRUE,
+                    row_order = dev_RowOrder_rownames, 
+                    row_title = "Developmentally-Induced", row_title_side = "left", row_title_gp = gpar(fontsize = 16),
+                    heatmap_legend_param = list(title = expression("log "[2]~"Fold Change"),  border = "black", title_position = "leftcenter-rot", legend_height = unit(4, "cm")),
+                    column_names_rot = 45, column_names_gp = grid::gpar(fontsize = 18),
+                    row_names_gp = grid::gpar(fontsize = 18),
+                    heatmap_width = unit(12, "cm"), height = unit(14, "cm"),
+                    column_labels = c("WT Mycelia", expression(italic(Delta~set7)~'Mycelia'), "WT Proto matA", "WT Proto mata", expression(italic(Delta~set7)~'FP matA'), expression(italic(Delta~set7)~'FP mata'), "WT dpf3", "WT dpf4", "WT dpf5", "WT dpf6"))
+
+ht4 <- draw(l2fc_plot_devgene)
+
+png("./Plots/FinalVersions/Fig2j_FP_clustered_l2fc_panel1.png",width=18,height=40,units="cm",res=1200)
+list_l2fc = l2fc_plot_k27 %v% l2fc_plot_devgene
+draw(list_l2fc)
+dev.off()
+
+  
+  
+### Plotting using roworder from L2FC heatmap
+tpm_plot_k27 <- Heatmap(tpmPC_K27genes, col = col_fun_tpm, 
+                    border = "black",
+                    cluster_columns = F, show_column_dend = FALSE, show_column_names = FALSE,
+                    show_row_names = FALSE,  show_row_dend = FALSE, show_heatmap_legend = FALSE,
+                    row_order = H3K27me3_RowOrder_rownames, 
+#                    row_title = "H3K27me3-marked", row_title_side = "left", row_title_gp = gpar(fontsize = 16),
+                    heatmap_width = unit(12, "cm"), height = unit(6, "cm"))
+ht2 <- draw(tpm_plot_k27)
+
+
+tpm_plot_devgene <- Heatmap(tpmPC_developmentsamples, col = col_fun_tpm, 
+                    border = "black",
+                    cluster_columns = F, show_column_dend = FALSE, show_column_names = TRUE,
+                    show_row_names = FALSE,  show_row_dend = FALSE, show_heatmap_legend = TRUE,
+                    row_order = dev_RowOrder_rownames, 
+#                    row_title = "Developmentally-Induced", row_title_side = "left", row_title_gp = gpar(fontsize = 16),
+                    heatmap_legend_param = list(title = expression("Expression Level (log "[2]~"(TPM+1)"),  border = "black", title_position = "leftcenter-rot", legend_height = unit(4, "cm"), legend_label_gp= gpar(fontsize = 18)),
+                    column_names_rot = 45, column_names_gp = grid::gpar(fontsize = 16),
+                    row_names_gp = grid::gpar(fontsize = 18),
+#                    legend_label_gp = grid::gpar(fontsize = 18),
+                    heatmap_width = unit(12, "cm"), height = unit(14, "cm"),
+                    column_labels = c("WT Mycelia", expression(italic(Delta~set7)~'Mycelia'), "WT Proto matA", "WT Proto mata", expression(italic(Delta~set7)~'FP matA'), expression(italic(Delta~set7)~'FP mata'), "WT dpf3", "WT dpf4", "WT dpf5", "WT dpf6"))
+
+ht3 <- draw(tpm_plot_devgene)
+
+png("./Plots/FinalVersions/Fig2j_FP_clustered_log2tpm_heatmap2.png",width=18,height=40,units="cm",res=1200)
+list_tpm = tpm_plot_k27 %v% tpm_plot_devgene
+draw(list_tpm)
+dev.off()
+
+```

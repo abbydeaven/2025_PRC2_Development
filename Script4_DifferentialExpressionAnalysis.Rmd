@@ -1,0 +1,327 @@
+---
+title: "Script4_DifferentialExpressionAnalysis"
+author: "Abby Deaven"
+date: "2025-05-12"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install(version = "3.21")
+
+BiocManager::install("edgeR")
+
+install.packages("purrr")
+install.packages("tidyverse")
+install.packages("vctrs")
+install.packages("dplyr")
+
+library(purrr)
+library(tidyverse)
+library(vctrs)
+library(dplyr) 
+library(tidyr)
+library(edgeR)
+
+```
+
+This script is for performing differential expression analysis on processed countFiles, using edgeR.
+
+```{r Loading datasets }
+### Loading in sample file#
+sampleFile <- read.table("./Datasets/RNAseq_Sample_File.txt",skip=0, header=TRUE,stringsAsFactors=FALSE, row.names=2, check.names=FALSE, sep="\t")
+
+###Loading count files
+all_counts <- read.table("./MatrixPlotting/Master_Counts.txt", header = T, sep = "\t")
+  all_counts <- all_counts %>% column_to_rownames(var = "X")
+  
+mergedcounts <- read.table("./MatrixPlotting/FP_Counts_Merged.txt", sep = "\t")
+  mergedcounts <- mergedcounts %>% rownames_to_column(var = "GeneID")
+
+##Reading in list of H3K27me3 GENES ##
+H3K27me3_genes <- read.table("./Final_Silent_H3K27me3_Genes.txt", sep="\t")
+
+
+```
+
+
+```{r Generating metadata for differential expression}
+##Creating metadata object for WT sexual development samples
+dev_samples_de <- sampleFile %>% 
+    filter(Category == "Sexual Development" & Treatment == "" & Source.Name != "Sexual Development Dataset2") %>%
+    select(SRR, Tissue, Genotype) %>%
+    mutate(Sample = c(rep("dpf6", 2), rep("dpf5", 2), rep("dpf4", 2), rep("dpf3", 2))) %>%
+    mutate(SampleName = c(rep("dpf3 Perithecium", 2), rep("dpf5 Perithecium", 2), rep("dpf4 Perithecium", 2), rep("dpf3 Perithecium", 2))) %>%
+    mutate(Tissue = "WT Perithecium")
+
+           
+
+#### Creating a panel of control samples --- including controls that cluster the closest together + YPD controls from developmental time course
+
+##Make list of control samples           
+  mycelia_samples <- sampleFile %>%
+    filter(Category == "Controls")
+  
+  ##Subset countmatrix to only include controls to plot clusters
+  controls_counts <- data.frame(all_counts[,colnames(all_counts) %in% mycelia_samples$SRR]) 
+
+  #control corrplot
+  library(corrplot)
+  c = cor(controls_counts)
+  corrplot(c, method = 'color')
+
+  #Selecting samples with best clustering
+  control_samples <- c("SRR11266659", "SRR11266660", "SRR11768110", "SRR11768111", "SRR11768112", "SRR11768113", "SRR5177529","SRR5177530")
+
+## Creating final list of SRRs to obtain from public data
+  # Annotating "SRR5177529","SRR5177530" as WT_2 -- will use in differential expression against other WT samples to control for variation in perithecia data. These samples were grown in YPD and were controls for the Liu et. al 2017 RNA-seq study of perithecial development. 
+  
+  mycelia_samples_filtered <- sampleFile %>%
+    filter(SRR %in% control_samples) %>%
+    select(SRR, Tissue, Genotype) %>%
+    mutate(Sample = c(rep("WT_2", 2), rep("WT_1", 6))) %>%
+    mutate(SampleName = "WT Mycelia")
+
+  DE_samples <- rbind(mycelia_samples_filtered, dev_samples_de)
+  write.table(DE_samples, file="./DifferentialExpression/DE_published_meta.txt", sep="\t")
+
+# DE_samples <- read.table("./DifferentialExpression/DE_published_meta.txt", sep="\t")
+
+## Creating reference sheet for false perithecia RNA samples
+FP_sample_meta <- data.frame(
+    SRR = c("set7_Mycelia_Rep1", "set7_Mycelia_Rep2", "set7_Mycelia_Rep3", "set7_matAA_FP_Rep1", "set7_matAA_FP_Rep2", "set7_matAA_FP_Rep3", "set7_mata_FP_Rep1", "set7_mata_FP_Rep2", "WT_matAA_PP_Rep1",  "WT_matAA_PP_Rep2", "WT_matAA_PP_Rep3", "WT_mata_PP_Rep1", "WT_mata_PP_Rep2", "WT_mata_PP_Rep3"),
+     Tissue = c(rep("Mycelia", 3), rep("False Perithecium", 5), rep("Protoperithecium", 6)),
+     Genotype = c(rep("WT", 3), rep("set7", 5), rep("WT",6)),
+     Sample = c(rep("set7_Mycelia", 3), rep("set7matAA_FP", 3), rep("set7mata_FP",2), rep("WTmatAA_PP", 3), rep("WTmata_PP", 3)),
+     SampleName = c(rep('set7 Mycelia', 3), rep('set7 FP matA', 3), rep('set7 FP mata',2), rep("WT Protoperithecia matA", 3), rep("WT Protoperithecia mata", 3)))
+      
+
+## Merge meta files
+DE_all_meta <- rbind(DE_samples, FP_sample_meta)
+write.table(DE_all_meta, file="./DifferentialExpression/DE_all_meta.txt", sep="\t")
+
+```
+
+
+Next step is to set up a merged matrix of counts from published RNA-seq datasets and false perithecia RNA-seq samples from this study.
+Performing differential expression analysis in edgeR
+
+```{r Setting up count matrix for DE analysis]}
+#meta <- read.table("./DifferentialExpression/DE_all_meta.txt",skip=0, header=FALSE,stringsAsFactors=FALSE,check.names=FALSE, sep="\t")
+
+### Using SRRs from gene list generated previously (WT samples + developmental timecourse + false perithecia/set7 sample) for differential expression analysis
+#First subsetting count matrix for genes included in analysis
+
+DE_published_counts <- data.frame(all_counts[,colnames(all_counts) %in% DE_all_meta$SRR])
+
+# Merging with false perithecia + set7 counts generated for this paper (mergedcounts = data frame of counts with sequencing replicates averaged)
+DE_published_counts <- DE_published_counts %>% rownames_to_column(var = "GeneID")
+#mergedcounts <- mergedcounts %>% rownames_to_column(var = "GeneID") 
+
+DE_all_counts <- DE_published_counts %>% left_join(mergedcounts, by = "GeneID", keep = FALSE) %>%
+  column_to_rownames(var = "GeneID")
+
+sample_info <- DE_all_meta$Sample
+write.table(DE_all_counts, file="./DifferentialExpression/DE_all_counts.txt")
+```
+
+
+Performing actual DE analysis
+
+```{r DE analysis}
+
+### Making EdgeR DE object
+dge <- DGEList(counts = DE_all_counts, group = sample_info)
+dge
+
+
+## relaxed filtering to remove any samples with < 5 cpm in any sample ##
+keep <- filterByExpr(y = dge, min.count	= 5)
+summary(keep) ##  removes 79 genes 
+dge <- dge[keep, , keep.lib.sizes=FALSE]
+dge_norm <- calcNormFactors(object = dge)
+print(dge_norm$samples)
+
+#normalizing and setting levels/design ###
+design_mat <- model.matrix(~ 0 + dge$samples$group)
+colnames(design_mat) <- levels(dge_norm$samples$group)
+dge_norm2 <- estimateGLMCommonDisp(dge_norm,design_mat)
+
+##using bin.spline method to estimage dispersion
+#bin_spline - shows best fit #
+dge_norm2_bin.spline <- estimateGLMTrendedDisp(dge_norm2,design_mat, method="bin.spline")
+dge_norm2_bin.spline <- estimateGLMTagwiseDisp(dge_norm2_bin.spline,design_mat)
+bcv_bin.spline <- plotBCV(dge_norm2_bin.spline)
+
+### estimateDisp = quantile-adjusted conditional maximum likelihood; uses pseudocounts
+fit <- glmQLFit(dge_norm2_bin.spline, design_mat, robust=TRUE)
+
+jpeg("./glmQLF_plotQLDisp2.jpg")
+plotQLDisp(fit)
+dev.off()
+
+
+```
+
+Fit is good -- okay to proceed with DE analysis
+Each sample will be compared to WT_1 (aggregate of WT mycelia samples grown on VMM + 2% sucrose, 32C, etc.). WT_2 will be compared against WT_1 to see variation in mycelial RNA-seq. The results of DE analysis will be written to a separate .csv file in a directory (/DEG_Files)
+
+
+```{r Identifying DEGs in each dataset}
+
+##### Performing DE analysis on each sample #####
+### 3 dpf ###
+dpf3 <- glmQLFTest(fit, contrast = c(1,0,0,0,0,0,0,-1,0,0,0))
+  degs_dpf3 <- topTags(dpf3, n = 10000)
+  write.csv(degs_dpf3$table, file="./DifferentialExpression/DEG_Files/dpf3_deg.csv")
+
+sum3 <- data.frame(summary(decideTests(object = dpf3, lfc = 2)))
+DE_summary <- data.frame(row.names = c("Down", "NotSig", "Up"),
+                          dpf3 = sum3$Freq)
+
+### 4 dpf ###
+dpf4 <- glmQLFTest(fit, contrast = c(0,1,0,0,0,0,0,-1,0,0,0))
+  degs_dpf4 <- topTags(dpf4, n = 10000)
+  write.csv(degs_dpf4$table, file="./DifferentialExpression/DEG_Files/dpf4_deg.csv")
+
+sum4 <- data.frame(summary(decideTests(object = dpf4, lfc = 2)))
+  DE_summary$dpf4 <- (sum4$Freq)
+
+### 5 dpf ###
+dpf5 <- glmQLFTest(fit, contrast =  c(0,0,1,0,0,0,0,-1,0,0,0))
+  degs_dpf5 <- topTags(dpf5, n = 10000)
+  write.csv(degs_dpf5$table, file="./DifferentialExpression/DEG_Files/dpf5_deg.csv")
+
+sum5 <- data.frame(summary((decideTests(object = dpf5, lfc = 2))))
+  DE_summary$dpf5 <- (sum5$Freq)
+
+### 6 dpf ###
+dpf6 <- glmQLFTest(fit, contrast = c(0,0,0,1,0,0,0,-1,0,0,0))
+  degs_dpf6 <- topTags(dpf6, n = 10000)
+  write.csv(degs_dpf6$table, file="./DifferentialExpression/DEG_Files/dpf6_deg.csv")
+
+sum6 <- data.frame(summary((decideTests(object = dpf6, lfc = 2))))
+  DE_summary$dpf6 <- (sum6$Freq)
+
+### set7 
+  set7 <- glmQLFTest(fit, contrast = c(0,0,0,0,1,0,0,-1,0,0,0))
+  degs_set7 <- topTags(set7, n = 10000)
+  write.csv(degs_set7$table, file="./DifferentialExpression/DEG_Files/set7_deg.csv")
+
+sum_set7 <- data.frame(summary((decideTests(object = set7, lfc = 2))))
+  DE_summary$set7 <- (sum_set7$Freq)
+
+### set7 mat a FP
+  FPset7_mata <- glmQLFTest(fit, contrast = c(0,0,0,0,0,1,0,-1,0,0,0))
+  degs_FPset7_mata <- topTags(FPset7_mata, n = 10000)
+  write.csv(degs_FPset7_mata$table, file="./DifferentialExpression/DEG_Files/FPset7_mata_deg.csv")
+
+sum_FPset7_mata <- data.frame(summary((decideTests(object = FPset7_mata, lfc = 2))))
+  DE_summary$FPset7_mata <- (sum_FPset7_mata$Freq)
+
+### set7 mat a FP
+  FPset7_matAA <- glmQLFTest(fit, contrast = c(0,0,0,0,0,0,1,-1,0,0,0))
+  degs_FPset7_matAA <- topTags(FPset7_matAA, n = 10000)
+  write.csv(degs_FPset7_matAA$table, file="./DifferentialExpression/DEG_Files/FPset7_matAA_deg.csv")
+
+sum_FPset7_matAA <- data.frame(summary((decideTests(object = FPset7_matAA, lfc = 2))))
+  DE_summary$FPset7_matAA <- (sum_FPset7_matAA$Freq)
+
+### WT_2 (YPD controls from developmental timecourse paper)
+  WT <- glmQLFTest(fit, contrast = c(0,0,0,0,0,0,0,-1,1,0,0))
+  degs_WT <- topTags(WT, n = 10000)
+  write.csv(degs_WT$table, file="./DifferentialExpression/DEG_Files/WT_deg.csv")
+
+sum_WT <- data.frame(summary((decideTests(object = WT, lfc = 2))))
+  DE_summary$WT <- (sum_WT$Freq)
+  
+  
+### WT mat a PP
+  PPwt_mata <- glmQLFTest(fit, contrast = c(0,0,0,0,0,0,0,-1,0,1,0))
+  degs_PPwt_mata <- topTags(PPwt_mata, n = 10000)
+  write.csv(degs_PPwt_mata$table, file="./DifferentialExpression/DEG_Files/PPwt_mata_deg.csv")
+
+sum_PPwt_mata <- data.frame(summary((decideTests(object = PPwt_mata, lfc = 2))))
+  DE_summary$PPwt_mata <- (sum_PPwt_mata$Freq)
+  
+### WT mat A PP
+  PPwt_matAA <- glmQLFTest(fit, contrast = c(0,0,0,0,0,0,0,-1,0,0,1))
+  degs_PPwt_matAA <- topTags(PPwt_matAA, n = 10000)
+  write.csv(degs_PPwt_matAA$table, file="./DifferentialExpression/DEG_Files/PPwt_matAA_deg.csv")
+
+sum_PPwt_matAA <- data.frame(summary((decideTests(object = PPwt_matAA, lfc = 2))))
+  DE_summary$PPwt_matAA <- (sum_PPwt_matAA$Freq)
+
+ #### writing up/down summary to text files ####
+write.table(DE_summary, file = "./FP_DE_Summary", sep = "\t")
+```
+
+PART 2 - ANALYZING DE SAMPLES 
+DEG files from /DEG_Files directory will be read in, converted to a matrix, and then filtered to identify genes with significant upregulation. 
+
+```{r Analyzing DE samples}
+############## Part 2: Analysis ####################
+### Reading in DEG files
+
+#Read in differential expression files
+deg_files<- list.files(path = "./DifferentialExpression/DEG_Files", pattern = "*.csv", full.names = T, recursive = F)
+  
+#Creating count matrix of geneID and loci:
+de_genes <- readr::read_csv(deg_files, id = "file_name")
+colnames(de_genes) <- c("Sample", "GeneID", "logFC", "logCPM", "F","Pvalue", "FDR")
+
+#Removing file path from sample IDs
+de_genes$Sample <- gsub("./DifferentialExpression/DEG_Files/", "", de_genes$Sample)
+de_genes$Sample <- gsub("_deg.csv", "", de_genes$Sample)
+
+write.table(de_genes, file = "./DifferentialExpression/DE_Gene_Matrix.txt", sep = "\t")
+
+#de_genes <- read.table("./DifferentialExpression/DE_Gene_Matrix_FDR.txt", sep="\t")
+de_genes <- read.table("./DifferentialExpression/DE_Gene_Matrix.txt", sep = "\t")
+
+#Removing columns that we will not use for analysis 
+de_gene_matrix <- de_genes %>% select(Sample, GeneID, logFC, FDR)
+
+#Filtering dataset to only include H3K27me3-enriched genes
+
+## identifying if any H3K27me3-enriched genes are removed during filtering step ##
+kept <- data.frame(which(keep))
+kept <- rownames_to_column(kept)
+lost <- filter(genes, ! GeneID %in% kept$rowname)
+lost_prc2 <- filter(lost, GeneID %in% K27_K36_ComarkedGenes$V1) ## 38 prc2 targets were excluded from analysis
+prc2_kept <- filter(K27_K36_ComarkedGenes, ! V1 %in% lost$GeneID)
+prc2_included <- prc2_kept$V1
+
+
+##identifying developmentally-upregulated genes -> log2fc >2 and fdr < 0.05
+timecourse_samples = c("dpf3", "dpf4", "dpf5", "dpf6")
+developmental_degs <- de_gene_matrix %>% 
+        filter(Sample %in% timecourse_samples) %>%
+        filter(logFC > 2 & FDR < 0.05)
+
+dev_genes <- data.frame(GeneID = unique(developmental_degs$GeneID))  ### 2993 total developmental genes
+write.table(dev_genes, file = "./DifferentialExpression/Developmental_Induced_Genes_all.txt", sep = "\t")
+colnames(developmental_degs) <- c("Sample","GeneID","logFC","FDR")
+
+dev_genes <- read.table("./DifferentialExpression/Developmental_Induced_Genes_all.txt", sep = "\t")
+
+## filtering for significant H3K27me3-enriched genes
+PRC2_degs <- subset(dev_genes, GeneID %in% H3K27me3_genes$V1)
+dev_genes_H3K27 <- unique(PRC2_degs$GeneID)  ### 440/516 H3K27me3-enriched genes are upregulated developmental genes
+write.table(dev_genes_H3K27, file = "./DifferentialExpression/Developmental_Induced_Genes_H3K27me3.txt", sep = "\t")
+
+#dev_genes_H3K27 <- read.table("../DifferentialExpression/Developmental_Induced_Genes_H3K27me3.txt", sep = "\t")
+
+dev_nonprc2 <- dev_genes %>% filter(! GeneID %in% dev_genes_H3K27) ###2553/2993 DIGs are non-PRC2 methylated
+write.table(dev_nonprc2, file="./DifferentialExpression/Developmental_Induced_Genes_nonH3K27me3.txt", sep = "\t")
+
+## significant upregulated genes in set-7 mycelia
+set7PRC2_degs <- de_gene_matrix %>% 
+  filter(Sample == "set7" & GeneID %in% H3K27me3_genes$V1) %>%
+  filter(logFC > 2 & FDR < 0.05)
+set7_genes_H3K27 <- unique(set7PRC2_degs$GeneID)  ### 218/516 H3K27me3-enriched genes are upregulated developmental genes
+
+```

@@ -1,0 +1,361 @@
+---
+title: "Script6 - FungalDevelopment_SupplementCode"
+author: "Abby Deaven"
+date: "2025-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("edgeR")
+BiocManager::install("InteractiveComplexHeatmap")
+
+install.packages("purrr")
+install.packages("dplyr")
+install.packages("edgeR")
+install.packages("tidyverse")
+install.packages("vctrs")
+install.packages("ComplexHeatmap")
+install.packages("ggtext")
+
+library(purrr)
+library(tidyverse)
+library(vctrs)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(ggplot2)
+library(ComplexHeatmap)
+library(InteractiveComplexHeatmap)
+library(ggtext)
+require("ggrepel")
+library(matrixStats)
+
+
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+#Read in files generated above
+all_tpm <- read.table("./MatrixPlotting/Average_Master_TPM.txt", header = T, sep = "\t")
+
+all_tpm <- all_tpm %>% column_to_rownames(var = "GeneID") %>%
+    mutate_all(as.numeric) %>%
+    select(-Length)
+
+sampleFile <- read.table("./Datasets/RNAseq_Sample_File.txt",skip=0, header=TRUE,stringsAsFactors=FALSE,  check.names=FALSE, sep="\t")
+
+K27_K36_ComarkedGenes <- read.table("./Final_Silent_H3K27me3_Genes.txt", header=FALSE,stringsAsFactors=FALSE, check.names=FALSE, sep="\t")
+
+
+```
+
+
+```{r}
+## Creating separate dataset of older sexual development RNA-seq
+remove_dataset = c("SRR5177521", "SRR5177522", "SRR5177523", "SRR5177524", "SRR5177525", "SRR5177526", "SRR5177527", "SRR5177528")
+sampleFile_filtered_sexdev2 <- sampleFile %>% 
+#  rownames_to_column(var = "SampleID") %>%
+  filter(!SRR %in% remove_dataset) %>%
+  select(SRR, SampleID, Category)
+
+#all start with SRR5856
+dev <- all_tpm %>% select(contains("SRR5856")) 
+
+# other dataset for supplemental figure
+all_tpm_sexdev2 <- all_tpm %>% select(-contains("SRR51775")) 
+
+```
+
+## Figure S1: Heatmap with other sexual development data (Wang et. al 2014)
+
+```{r pressure, echo=FALSE}
+#convert TPM matrix to longform table using pivot_longer
+all_tpm_sexdev2 <- all_tpm_sexdev2 %>% rownames_to_column(var = "GeneID")
+all_tpm_long2 <- all_tpm_sexdev2 %>% pivot_longer(cols = !GeneID, names_to = "SRR", values_to = "TPM")
+
+#add metadata from sampleFile
+avg_tpm_longer_meta2 <- full_join(all_tpm_long2, sampleFile_filtered_sexdev2)
+
+supplement_select <- c("Controls", "Sexual Development")
+avg_tpm_longer_meta2 <- avg_tpm_longer_meta2 %>% filter(Category %in% supplement_select)
+
+
+
+## remove outliers --- anything > 95th percentile is normalized to the 95th percentile
+qn = quantile(avg_tpm_longer_meta2$TPM, c(0.05, 0.95), na.rm = TRUE)
+
+avg_tpm_longer_meta2 = within(avg_tpm_longer_meta2, { TPM = ifelse(TPM < qn[1], qn[1], TPM)
+                                                         TPM = ifelse(TPM > qn[2], qn[2], TPM)})
+
+#calculate TPM+PC
+avg_tpm_longer_meta2 <- avg_tpm_longer_meta2 %>% mutate(TPM_plusPC = TPM+1)
+
+### calculate stats###
+
+#First, make melted df with only PRC2 target genes
+PRC2targetsOnly_Data <- filter(avg_tpm_longer_meta2, GeneID %in% K27_K36_ComarkedGenes[,1])
+
+#make a TPM+ pseudocount column
+#PRC2targetsOnly_Data <- PRC2targetsOnly_Data %>% mutate(TPM_plusPC = TPM+1)
+#PRC2targetsOnly_Data_alt <- PRC2targetsOnly_Data_alt %>% mutate(TPM_plusPC = TPM+1)
+
+
+#Second, calculate average expression and sd for each gene;
+Averaged_GE <- PRC2targetsOnly_Data %>% 
+  group_by(SRR,SampleID,GeneID,Category) %>%
+  summarize(AveragePC_perGene = mean(TPM_plusPC),
+            SdPC_perGene = sd(TPM_plusPC)) 
+
+#Calculate average TPM for all Samples adn the SD for all samples
+Averaged_GE_AllSamples <- Averaged_GE %>% 
+  group_by(GeneID) %>%
+  summarize(MeanExpressionLevel_AllStrains = mean(AveragePC_perGene),
+            MedianExpressionLevel_AllStrains = median(AveragePC_perGene),
+            VariationInExpression_AllStrains= sd(AveragePC_perGene))
+
+
+Averaged_GE <- left_join(Averaged_GE, Averaged_GE_AllSamples, by="GeneID")
+
+Averaged_GE_count <- length(unique(Averaged_GE$GeneID))
+
+Averaged_GE <- Averaged_GE %>% subset(MedianExpressionLevel_AllStrains < 6)
+
+Averaged_GE_count2 <- length(unique(Averaged_GE$GeneID))
+
+Averaged_GE <- Averaged_GE %>%
+  group_by(SRR,SampleID,GeneID,Category) %>%
+  mutate(Z = ((.data[["AveragePC_perGene"]] - .data[["MeanExpressionLevel_AllStrains"]])/.data[["VariationInExpression_AllStrains"]]))
+
+#Calculate Average expression of PRC2 target genes for the set
+
+#Third, calculate the average expression of all PRC2 target genes for each strain (locus)
+SampleStats <- Averaged_GE %>% 
+  group_by(SRR,SampleID, Category) %>%
+  summarize(Mean = mean(AveragePC_perGene, na.rm=TRUE),
+            NumberofGenes_ZaboveOne = sum(Z>1),
+            NumberofGenes_ZabovePointFive = sum(Z>.5),
+            MeanZ = mean(Z),
+            MedianZ = median(Z),
+            Median = median(AveragePC_perGene),
+            SD = sd(AveragePC_perGene))
+
+### Calculating Induction Score -- Mean Expression of K27me3-marked genes * Percentage of H3K27me3-marked genes with Z > .5
+SampleStats_dev2 <- SampleStats %>%
+    mutate(Score = (Mean)*((NumberofGenes_ZabovePointFive)/516))
+
+
+write.table(SampleStats_dev2, file="./Supplement/SampleStats_Supplement.txt", sep= "\t")
+
+### In Excel, sorted SampleStats table by category and induction score, then read back in to use order for heatmapping. Samples are sorted in chronological order ###
+
+SampleStats_sorted <- read.table("./Supplement/SampleStats_Supplement_Ordered.txt", sep = "\t", header = TRUE)
+
+SRR_Order <- SampleStats_sorted %>% 
+  select(SRR, Category, Order)
+
+SRR <- SRR_Order$SRR
+## subset PRC2-target longform matrix to only include SRRs we want ##
+PRC2targetsOnly_Data_Subset <- subset(PRC2targetsOnly_Data, SRR %in% SRR_Order$SRR)
+
+#Subset to only include GeneID, SRR, and TPM+PC
+PRC2map <- data.frame(cbind(PRC2targetsOnly_Data_Subset$GeneID, PRC2targetsOnly_Data_Subset$SRR, PRC2targetsOnly_Data_Subset$TPM_plusPC))
+colnames(PRC2map) <- c("GeneID","SRR","TPM_plusPC")
+PRC2map$TPM_plusPC <- as.numeric(PRC2map$TPM_plusPC)
+
+
+#Arrange matrix in order
+sorted_prc2mapmatrix <- right_join(SRR_Order, PRC2map, by = c("SRR" = "SRR"), relationship = "one-to-many")
+
+
+sorted_prc2mapmatrix2 <- sorted_prc2mapmatrix[order(sorted_prc2mapmatrix$GeneID), ]
+
+sorted_prc2mapmatrix3 <- data.frame(cbind(sorted_prc2mapmatrix2$GeneID, sorted_prc2mapmatrix2$SRR, sorted_prc2mapmatrix2$TPM_plusPC))
+colnames(sorted_prc2mapmatrix3) <- c("GeneID","SRR","TPM_plusPC")
+sorted_prc2mapmatrix3$TPM_plusPC <- as.numeric(sorted_prc2mapmatrix3$TPM_plusPC)
+
+##Pivot to wideform matrix##
+PRC2mapmatrix <- PRC2map %>% 
+  pivot_wider( 
+  names_from = SRR, 
+  values_from = TPM_plusPC )
+
+PRC2mapmatrix <- PRC2mapmatrix %>% tibble::column_to_rownames(var = "GeneID")
+PRC2mapmatrix <- as.matrix(PRC2mapmatrix)
+
+### complex heatmap ###
+library(ComplexHeatmap)
+library(circlize)
+
+anno_df = data.frame(
+    Category = SRR_Order$Category)
+ha = HeatmapAnnotation(df = anno_df, 
+          col = list(Category = c("Controls"= "#F0E442", 
+#                                 "Wild Isolates" = "#56B4DF", 
+#                                  "Asexual Development" = "#009E73",
+#                                  "Light Response" = "#D55E00", 
+#                                  "Stress/Drug Response" = "#0072B2", 
+#                                  "Carbon/Nitrogen Source" = "#E69F00",
+                                  "Sexual Development" = "#CC79A7")),
+          annotation_legend_param = list(title = "Category",  border = "black", title_position = "leftcenter-rot", legend_height = unit(6, "cm")))
+
+scaled_PRC2mapmatrix = t(scale(t(PRC2mapmatrix)))
+
+min(scaled_PRC2mapmatrix) #-1.344
+max(scaled_PRC2mapmatrix) #5
+
+scaled_tpmPC_matrix_devonly <- scaled_PRC2mapmatrix[,14:27]
+
+scaled_tpmPC_matrix_devonly <- as.matrix(scaled_tpmPC_matrix_devonly)
+col_fun2 = colorRamp2(c(-6, 0, 6), c("#5e3c99","#F8F2EA","#e66101"))
+
+scaled_PRC2mapmatrix <- as.matrix(scaled_PRC2mapmatrix)
+
+heatmap_ORDER_dev <- Heatmap(scaled_tpmPC_matrix_devonly, col=col_fun2, cluster_columns = F, show_row_names = FALSE, show_column_dend = FALSE, show_row_dend = FALSE, clustering_method_rows = "complete")
+ht <- draw(heatmap_ORDER_dev)
+devRowOrder <- row_order(ht)
+dev_ordered_rownames <- rownames(scaled_tpmPC_matrix_devonly)[unlist(devRowOrder)]
+
+lgd = Legend(col_fun = col_fun2, title = "Relative Expression")
+
+order = SRR_Order$SRR
+ supp_plot  <- Heatmap(scaled_PRC2mapmatrix, col = col_fun2,
+                    border = "black",
+                    cluster_columns = F, show_row_names = FALSE, show_column_dend = FALSE, show_row_dend = FALSE, show_column_names = T,
+                    row_order = devRowOrder,row_title = "H3K27me3-Enriched Genes", row_title_side = "left",
+                    column_order = order,
+                    column_split = factor(as.character(SRR_Order$Category), levels = c("Controls", "Sexual Development")), 
+#                    cluster_column_slices = FALSE,
+                    heatmap_legend_param = list(title = "Relative Expression",  border = "black", title_position = "leftcenter-rot", legend_height = unit(4, "cm")),
+                    column_names_rot = 45, column_names_gp = grid::gpar(fontsize = 16),
+                    top_annotation = ha,
+                    width = unit(20, "cm"), height = unit(12, "cm"))
+ht2 <- draw(supp_plot)
+
+
+png("./Plots/FinalVersions/FigS1_Developmental_Heatmap_2.png",width=30,height=30,units="cm",res=1200)
+draw(ht2)
+dev.off()
+
+```
+
+Figure S2: 
+  A) Correlation plot of false perithecia RNA-seq experiments
+  B) Amplitude of differential expression of H3K27me3-marked genes and developmental genes in false perithecia RNA-seq samples
+
+```{r}
+## Loading all FP RNA-seq files into EdgeR to generate normalized counts for correlation matrix
+fp_counts <- read.table("./MatrixPlotting/FP_counts.txt", sep = "\t")
+#Calculate tpm
+fp_countsonly<- fp_counts[,6:ncol(fp_counts)]
+fp_counts$Length <- as.numeric(fp_counts[,5])
+
+
+##changing colnames to be more readable
+colnames(fp_countsonly) <- gsub("X","",colnames(fp_countsonly))
+
+corr <- cor(fp_countsonly)
+corrplot <- ggcorrplot(corr, hc.order = TRUE,
+  tl.cex = 16, 
+  lab=FALSE,
+  ggtheme = ggplot2::theme_minimal,
+  colors = c("#4dac26","#f7f7f7","#d01c8b"))
+
+png("./Plots/FinalVersions/FigS2A_Correlation_Plot.png",width=30,height=30,units="cm",res=1200)
+print(corrplot)
+dev.off()
+
+```
+
+
+```{r S2b}
+
+de_gene_matrix <- read.table("./DifferentialExpression/DE_Gene_Matrix.txt", sep = "\t")
+
+
+de_gene_matrix$Corrected_logFC <- with(de_gene_matrix, ifelse(FDR > 0.05, 0, logFC))
+
+deL2FC_matrix <- de_gene_matrix %>% 
+  select(Sample, Corrected_logFC, GeneID) %>%
+  pivot_wider( 
+  names_from = Sample, 
+  values_from = Corrected_logFC)
+
+l2fc_K27genes <- (deL2FC_matrix[rownames(deL2FC_matrix) %in% H3K27me3_genes$V1,])
+
+
+#l2fc_k27_summary <- l2fc_K27genes %>%   summarise(across(where(is.numeric), mean)) %>%
+#    summarise(across(where(is.numeric), n(">2")))
+                     
+dev_samples_l2fc <- deL2FC_matrix %>%
+                    select(-contains("dpf"), -starts_with("WT"))
+#                   rownames_to_column(var = "GeneID")
+
+dev_samples_l2fc <- dev_samples_l2fc %>%
+                  pivot_longer(cols = !GeneID, names_to = "Sample", values_to = "log2FC")
+
+dev_non_prc2_l2fc <- dev_samples_l2fc %>%
+  filter(GeneID %in% dev_nonprc2$GeneID) %>%
+  mutate(Category = str_wrap("Not PRC2 -methylated", width = 5))
+
+prc2_samples_l2fc <- dev_samples_l2fc %>%
+  filter(GeneID %in% H3K27me3_genes$V1) %>%
+  mutate(Category = str_wrap("PRC2 -methylated", width = 5))
+
+
+#merging each matrix together
+total <- rbind(dev_non_prc2_l2fc, prc2_samples_l2fc)
+total$Sample <- factor(total$Sample, levels = c("set7",  "PPwt_mata", "PPwt_matAA", "FPset7_mata", "FPset7_matAA"))
+
+total_na <- total
+total_na[total_na == 0] <- NA
+### this part is just for determining the order of samples in the violin plot -- groups genes by sample (3dpf, mycelia, etc) and then summarizes how many total genes are in each sample (is the same for each one) ###
+total2 <- total_na %>%
+  group_by(Sample)
+total_dist = total_na %>%
+  group_by(Sample) %>% summarise(num=n())
+total2$Category = str_wrap(total$Category, width = 12)
+
+#Setting distance between violins in plot
+dodge <- position_dodge(width = 1)
+###  plotting violin plot
+### this chunk is just for putting samples in the order that I want ###
+violin <- total2 %>%
+ left_join(total_dist) %>%
+#  arrange(factor(Sample, levels = c("set7",  "PPwt_mata", "PPwt_matAA", "FPset7_mata", "FPset7_matAA"))) %>%
+#  mutate(Sample = fct(Sample)) %>%
+  ### everything below is the actual violin plot ###
+  ggplot(aes(x=Sample, y=log2FC)) + 
+    geom_violin(aes(fill = factor(Category)), position = dodge, width = 0.75, scale="width", trim=FALSE) +
+    geom_boxplot(aes(group=interaction(Category,Sample)),
+         width=0.2, fill="white", position=dodge, outlier.shape=NA) +
+    scale_x_discrete(labels = c(expression(italic(Delta~set7)~'Mycelia'), "WT Proto mata", "WT Proto matA", expression(italic(Delta~set7)~'FP mata'), expression(italic(Delta~set7)~'FP matA'))) +
+    scale_y_continuous(limits = c(-1, 12)) +
+    scale_fill_manual("",values = c("orchid1", "springgreen2")) +
+    labs(
+       x = "Condition",
+       y = expression("Expression Level [log"[2]~"(Fold Change vs. WT)]")) + 
+  theme_classic(base_size = 22) +
+      theme(axis.line = element_line(color = "black",
+                                 linewidth = 1))+
+    theme(legend.text=element_text(size=24)) +
+    theme(axis.text.x=element_text(angle=45, hjust=1, size=24), panel.spacing.x=unit(0.5, "lines")) +
+    theme(axis.text.y=element_text(hjust=1, size=22), panel.spacing.y=unit(0.5, "lines"))
+
+print(violin)
+
+print(violin)
+ggsave("./Plots/FinalVersions/FigS2_Induction_BoxPlot.png", plot=violin, width = 12, height = 9, unit="in",  dpi=400)
+
+
+
+```
+
