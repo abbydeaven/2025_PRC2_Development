@@ -1,0 +1,122 @@
+---
+title: "Script3b-H3K27me3_Gene_List"
+author: "Abby Deaven"
+date: "2025-05-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	message = FALSE,
+	warning = FALSE,
+	include = FALSE
+)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+
+install.packages("purrr")
+install.packages("dplyr")
+install.packages("tidyverse")
+install.packages("vctrs")
+install.packages("ggtext")
+
+library(purrr)
+library(tidyverse)
+library(vctrs)
+library(dplyr)
+library(pheatmap)
+library(RColorBrewer)
+library(ggplot2)
+library(ComplexHeatmap)
+library(InteractiveComplexHeatmap)
+library(ggtext)
+require("ggrepel")
+library(matrixStats)
+
+
+
+```
+
+## R Markdown
+
+
+Reading in important files:
+- Matrix of tpm values from RNA-seq samples (Script 2)
+- List of H3K27me3 marked genes (Script 3a)
+- Metadata
+
+```{r}
+all_tpm <- read.table("/MatrixPlotting/Average_Master_TPM.txt", header = T, sep = "\t")
+
+```
+
+
+```{r Clean up sampleFile and generate final list of H3K27me3-marked genes}
+sampleFile <- read.table("./Datasets/RNAseq_Sample_File.txt",skip=0, header=TRUE,stringsAsFactors=FALSE, row.names=2, check.names=FALSE, sep="\t")
+
+K27_K36_ComarkedGenes <- read.table("./Datasets/Final_H3K27me3_H3K36me3_Comarked_NCU.txt", header=FALSE,stringsAsFactors=FALSE, check.names=FALSE, sep="\t")
+
+all_tpm <- read.table("/MatrixPlotting/Average_Master_TPM.txt", header = T, sep = "\t")
+
+
+## Removing potentially mislabeled samples from sampleFile -- these are mycelial WT samples with very high expression of H3K27me3-marked genes and do not cluster with other samples in correlation plot.
+remove_SRRs <- c("SRR13859508", "SRR11266658", "SRR11768109", "SRR5320488")
+sampleFile_filtered <- subset(sampleFile, !SRR %in% remove_SRRs)
+
+
+write.table(sampleFile_filtered, file = "./Datasets/RNAseq_Sample_File.txt", sep = "\t")
+###### Filtering list of H3K27me3-marked genes to remove outliers/genes in border regions
+#all_tpm <- column_to_rownames(all_tpm, var = "GeneID")
+
+mycelia_SRRs <- subset(sampleFile_filtered, Category == "Controls", select = SRR)
+mycelia_tpm <- data.frame(all_tpm[, colnames(all_tpm) %in% mycelia_SRRs$SRR])
+
+#Subset to only include H3K27me3/H3K36me3-marked genes, then calculate median + SD TPM for each gene
+mycelia_H3K27me3_tpm <- as.matrix(subset(mycelia_tpm, rownames(mycelia_tpm) %in% K27_K36_ComarkedGenes$V1))
+MedianTPM <- data.frame(row.names = rownames(mycelia_H3K27me3_tpm),
+                        MedianTPM = rowMedians(mycelia_H3K27me3_tpm))
+
+
+p <- ggplot(MedianTPM, aes(x = "", y = MedianTPM)) + 
+  geom_boxplot(outlier.shape = 2)
+
+## finding statistical outliers
+find_outlier <- function(x) {
+  return(x < quantile(x, .25) - 1.5*IQR(x) | x > quantile(x, .75) + 1.5*IQR(x))
+}
+
+
+pg <- ggplot_build(p)
+
+MedianTPM_Matrix <- as.matrix(MedianTPM)
+
+MedianTPM_Outliers <- MedianTPM %>% 
+  mutate(deepTools_group = ifelse(find_outlier(MedianTPM), "Outlier", "Non_Outlier")   
+)
+
+MedianTPM_Outliers <- rownames_to_column(MedianTPM_Outliers, var="GeneID")
+
+p2 <- ggplot(MedianTPM_Outliers, aes(x = outlier, y = MedianTPM)) + 
+  geom_boxplot()
+
+
+### Used deepTools to "generate a heatmap of H3K27me3-marked genes; importing bed file resulting from the first heatmap
+Heatmap_Bed <- read.table("./H3K27_H3K36_regions.bed", sep = "\t")
+colnames(Heatmap_Bed) = c("chrom", "start", "end", "GeneID", "score", "strand","v7","v8","v9","v10","v11","v12","")
+
+
+Outlier_bed_heatmap <- left_join(MedianTPM_Outliers, Heatmap_Bed, by = "GeneID")
+
+##removing median tpm column and replacing deepTools-generated clusters
+Outlier_Bed_File <- cbind(Outlier_bed_heatmap[,1],Outlier_bed_heatmap[,4:14],Outlier_bed_heatmap[,3])
+write.table(Outlier_Bed_File, file = "./H3K27me3_H3K36me3_silent_genes.bed", sep="\t", quote=FALSE)
+
+#Return final set of genes that are not outliers
+
+K27_K36_ComarkedGenes_Silent <- subset(MedianTPM_Outliers, deepTools_group == "Non_Outlier", select = GeneID )
+write.table(K27_K36_ComarkedGenes_Silent, file="./Final_Silent_H3K27me3_Genes.txt", sep ="\t")
+```
+
+## R Markdown
