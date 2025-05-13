@@ -1,5 +1,5 @@
 ---
-title: "Script3_Compiling_RNAseq_Counts"
+title: "Script2_Compiling_RNAseq_Counts"
 author: "Abby Deaven"
 date: "2024-02-09"
 output: html_document
